@@ -577,26 +577,43 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
             elif constraint_field == "choice":
                 structured_outputs = StructuredOutputsParams(choice=list(params.choice.choices))
 
-        # Build extra_args for kv_transfer_params (Mooncake PD)
+        # Build extra_args for kv_transfer_params (PD disaggregation)
         extra_args = None
         if kv_transfer_params:
-            remote_host = kv_transfer_params.remote_host
-            remote_port = kv_transfer_params.remote_port
-            if not remote_host or not (1 <= remote_port <= 65535):
-                raise ValueError(
-                    "Invalid kv_transfer_params: remote_host must be set and remote_port must be in [1, 65535]."
+            if kv_transfer_params.json_params:
+                # NIXL PD: opaque JSON params dict passed through verbatim
+                # (e.g. {"do_remote_decode": true} on prefill, or the full
+                # params dict from the prefill response on decode).
+                try:
+                    parsed_params = json.loads(kv_transfer_params.json_params)
+                except json.JSONDecodeError as e:
+                    raise ValueError(f"Invalid kv_transfer_params.json_params: {e}") from e
+                if not isinstance(parsed_params, dict):
+                    raise ValueError(
+                        "Invalid kv_transfer_params.json_params: expected a JSON object, "
+                        f"got {type(parsed_params).__name__}."
+                    )
+                logger.debug("kv_transfer_params (json)=%s", parsed_params)
+                extra_args = {"kv_transfer_params": parsed_params}
+            else:
+                # Mooncake PD: side-channel host/port fields
+                remote_host = kv_transfer_params.remote_host
+                remote_port = kv_transfer_params.remote_port
+                if not remote_host or not (1 <= remote_port <= 65535):
+                    raise ValueError(
+                        "Invalid kv_transfer_params: remote_host must be set and remote_port must be in [1, 65535]."
+                    )
+                logger.debug(
+                    "kv_transfer_params={remote_host=%s, remote_port=%d}",
+                    remote_host,
+                    remote_port,
                 )
-            logger.debug(
-                "kv_transfer_params={remote_host=%s, remote_port=%d}",
-                remote_host,
-                remote_port,
-            )
-            extra_args = {
-                "kv_transfer_params": {
-                    "remote_host": remote_host,
-                    "remote_port": remote_port,
+                extra_args = {
+                    "kv_transfer_params": {
+                        "remote_host": remote_host,
+                        "remote_port": remote_port,
+                    }
                 }
-            }
 
         # Create SamplingParams
         # output_kind=DELTA: Return only new tokens in each chunk (for streaming)
@@ -849,12 +866,17 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
             num_prompt_logprobs,
         )
 
-        # Build kv_transfer_params if present (Mooncake PD)
+        # Build kv_transfer_params if present (Mooncake or NIXL PD).
+        # json_params carries the full connector params dict (NIXL: remote
+        # block IDs, engine ID, side-channel address, ...) so the router can
+        # forward it verbatim to the decode worker. The Mooncake host/port
+        # fields are kept for backward compatibility.
         kv_transfer_params = None
         if output.kv_transfer_params:
             kv_transfer_params = vllm_engine_pb2.KvTransferParams(
-                remote_host=output.kv_transfer_params.get("remote_host", ""),
-                remote_port=output.kv_transfer_params.get("remote_port", 0),
+                remote_host=str(output.kv_transfer_params.get("remote_host") or ""),
+                remote_port=int(output.kv_transfer_params.get("remote_port") or 0),
+                json_params=json.dumps(output.kv_transfer_params),
             )
 
         # Build matched_stop kwargs from stop_reason (int token ID or str stop sequence)

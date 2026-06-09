@@ -158,7 +158,7 @@ message GenerateRequest {
   // Streaming
   bool stream = 5;
 
-  // KV transfer parameters for PD disaggregation (Mooncake)
+  // KV transfer parameters for PD disaggregation (Mooncake or NIXL)
   // Decode worker uses this to fetch KV cache from prefill worker
   KvTransferParams kv_transfer_params = 6;
 
@@ -166,10 +166,21 @@ message GenerateRequest {
   MultimodalInputs mm_inputs = 7;
 }
 
-// KV cache transfer parameters for Mooncake PD disaggregation
+// KV cache transfer parameters for PD disaggregation
 message KvTransferParams {
-  string remote_host = 1;  // Prefill worker's side-channel host
-  uint32 remote_port = 2;  // Prefill worker's side-channel port
+  string remote_host = 1;  // Mooncake: prefill worker's side-channel host
+  uint32 remote_port = 2;  // Mooncake: prefill worker's side-channel port
+
+  // NIXL: opaque JSON-encoded vLLM kv_transfer_params dict, passed through
+  // verbatim between the engine and the router.
+  // - Request direction: router -> engine. The prefill request carries
+  //   {"do_remote_decode": true}; the decode request carries the full params
+  //   dict returned by the prefill worker (remote_block_ids, remote_engine_id,
+  //   remote_host/port, ...) so the decode engine pulls KV over NIXL instead
+  //   of recomputing the prefill.
+  // - Response direction: engine -> router. The prefill worker's final
+  //   response carries the params dict produced by NixlConnector.
+  string json_params = 3;
 }
 
 // =====================
@@ -239,8 +250,8 @@ message GenerateComplete {
   // Index for n>1 support (0-indexed, identifies which of n outputs this belongs to)
   uint32 index = 8;
 
-  // KV transfer parameters returned by prefill worker (Mooncake PD)
-  // Contains prefill's side-channel address for decode to fetch KV cache
+  // KV transfer parameters returned by prefill worker (Mooncake or NIXL PD)
+  // Contains the info decode needs to fetch the KV cache from prefill
   KvTransferParams kv_transfer_params = 9;
 
   // Matched stop information (for stop sequences)

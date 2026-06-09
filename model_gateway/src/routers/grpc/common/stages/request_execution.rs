@@ -2,7 +2,7 @@
 
 use async_trait::async_trait;
 use axum::response::Response;
-use tracing::{debug, error, info_span, Instrument};
+use tracing::{debug, error, info_span, warn, Instrument};
 
 use super::PipelineStage;
 use crate::{
@@ -12,7 +12,10 @@ use crate::{
             context::{
                 ClientSelection, ExecutionResult, LoadGuards, RequestContext, WorkerSelection,
             },
-            proto_wrapper::{ProtoEmbedRequest, ProtoGenerateRequest, ProtoRequest, ProtoStream},
+            proto_wrapper::{
+                ProtoEmbedRequest, ProtoGenerateRequest, ProtoRequest, ProtoResponseVariant,
+                ProtoStream,
+            },
             utils::tonic_ext::{TonicResultExt, TonicStatusExt},
         },
     },
@@ -279,7 +282,11 @@ impl RequestExecutionStage {
     ///
     /// For Mooncake: uses bootstrap_host/port from prefill worker metadata to inject
     /// kv_transfer_params into decode request so decode knows where to fetch KV cache.
-    /// For NIXL: no kv_transfer_params needed (uses prompt prefix matching).
+    /// For NIXL: the prefill request is marked `{"do_remote_decode": true}` so the
+    /// prefill engine holds its KV blocks and returns transfer params (remote block
+    /// IDs, engine ID, side-channel address); those params are injected verbatim into
+    /// the decode request so the decode engine pulls the KV cache over NIXL instead
+    /// of recomputing the prefill.
     async fn execute_sequential_pd(
         &self,
         proto_request: ProtoGenerateRequest,
@@ -298,8 +305,7 @@ impl RequestExecutionStage {
         })?;
 
         // Get bootstrap info from prefill worker metadata (only for Mooncake PD)
-        // NIXL uses prefix matching and doesn't need kv_transfer_params
-        let kv_transfer_params: Option<(String, u32)> = workers
+        let mooncake_params: Option<(String, u32)> = workers
             .prefill_worker()
             .map(|w| w.metadata())
             .filter(|meta| meta.spec.kv_connector.as_deref() == Some(MOONCAKE_CONNECTOR))
@@ -307,36 +313,34 @@ impl RequestExecutionStage {
                 let port = meta.spec.bootstrap_port.unwrap_or(DEFAULT_BOOTSTRAP_PORT);
                 (meta.spec.bootstrap_host.clone(), port as u32)
             });
+        let is_mooncake = mooncake_params.is_some();
 
-        if let Some((ref host, port)) = kv_transfer_params {
+        if let Some((ref host, port)) = mooncake_params {
             debug!(
                 bootstrap_host = %host,
                 bootstrap_port = port,
                 "vLLM PD (Mooncake): will inject kv_transfer_params into decode request"
             );
         } else {
-            // Log at info level since this could indicate misconfiguration if user expects Mooncake
-            // NIXL doesn't need kv_transfer_params (uses automatic prefix matching)
-            // If user expects Mooncake but kv_connector wasn't discovered, they can manually set
-            // labels: { "kv_connector": "MooncakeConnector" } in worker config
-            let has_kv_connector = workers
-                .prefill_worker()
-                .map(|w| w.metadata().spec.kv_connector.is_some())
-                .unwrap_or(false);
-            if has_kv_connector {
-                debug!("vLLM PD (NIXL): using automatic prefix matching for KV transfer");
-            } else {
-                debug!(
-                    "vLLM PD: no kv_connector detected (server may not support GetServerInfo kv fields). \
-                     Assuming NIXL mode. For Mooncake, set labels.kv_connector=MooncakeConnector in worker config"
-                );
-            }
+            // NIXL mode (or kv_connector not discoverable, in which case NIXL is
+            // assumed). For Mooncake, set labels.kv_connector=MooncakeConnector in
+            // worker config if GetServerInfo doesn't report it.
+            debug!(
+                "vLLM PD (NIXL): marking prefill request do_remote_decode and \
+                 forwarding returned kv_transfer_params to decode"
+            );
         }
 
         // Clone request and set max_tokens=1, stream=false for prefill
         let mut prefill_request = proto_request.clone_inner();
         prefill_request.set_max_tokens_for_prefill(1);
         prefill_request.set_stream(false);
+        if !is_mooncake {
+            // NIXL: tell the prefill engine to hold KV blocks for a remote decode
+            // and return transfer params in its final response.
+            prefill_request
+                .set_kv_transfer_params_json(r#"{"do_remote_decode":true}"#.to_string());
+        }
 
         debug!(
             request_id = %prefill_request.request_id(),
@@ -353,11 +357,20 @@ impl RequestExecutionStage {
                 e.to_http_error("prefill_worker_failed_to_start", format!("Prefill worker failed to start: {}", e.message()))
             })?;
 
-        // Drain prefill response (we just need to wait for completion)
+        // Drain prefill response; for NIXL, capture the kv_transfer_params the
+        // prefill engine returns in its final (complete) message.
+        let mut nixl_params_json: Option<String> = None;
         while let Some(result) = prefill_stream.next().await {
             match result {
-                Ok(_response) => {
-                    // Just consume the response, we use bootstrap info from worker metadata
+                Ok(response) => {
+                    if !is_mooncake {
+                        if let ProtoResponseVariant::Complete(complete) = response.into_response()
+                        {
+                            if let Some(json) = complete.kv_transfer_params_json() {
+                                nixl_params_json = Some(json);
+                            }
+                        }
+                    }
                 }
                 Err(e) => {
                     workers.record_outcome_prefill(e.http_status().as_u16());
@@ -374,15 +387,29 @@ impl RequestExecutionStage {
 
         debug!("vLLM PD: prefill completed, sending decode request");
 
-        // Clone original request and inject kv_transfer_params if present (Mooncake)
+        // Clone original request and inject kv_transfer_params
         let mut decode_request = proto_request;
-        if let Some((remote_host, remote_port)) = kv_transfer_params {
+        if let Some((remote_host, remote_port)) = mooncake_params {
             debug!(
                 remote_host = %remote_host,
                 remote_port = remote_port,
                 "vLLM PD: injecting kv_transfer_params into decode request"
             );
             decode_request.set_kv_transfer_params(remote_host, remote_port);
+        } else if let Some(json) = nixl_params_json {
+            debug!(
+                kv_transfer_params = %json,
+                "vLLM PD (NIXL): injecting prefill kv_transfer_params into decode request"
+            );
+            decode_request.set_kv_transfer_params_json(json);
+        } else {
+            // Without params the decode engine recomputes the prefill locally;
+            // the request still succeeds but PD provides no benefit.
+            warn!(
+                "vLLM PD (NIXL): prefill returned no kv_transfer_params; decode will \
+                 recompute the prefill (check that workers run a smg-grpc-servicer \
+                 version that forwards NIXL kv_transfer_params)"
+            );
         }
 
         // Send request to decode

@@ -254,8 +254,9 @@ fn apply_tokenspeed_sampling_defaults(
 /// Inject PD bootstrap metadata for SGLang if needed.
 ///
 /// SGLang uses DisaggregatedParams with bootstrap host/port/room.
-/// vLLM uses different mechanisms: NIXL (automatic prefix matching) or
-/// Mooncake (kv_transfer_params injected in request_execution stage).
+/// vLLM uses different mechanisms, both handled in the request_execution
+/// stage: NIXL (prefill's returned kv_transfer_params forwarded to decode)
+/// or Mooncake (bootstrap host/port injected into the decode request).
 pub(crate) fn maybe_inject_pd_metadata(
     request: &mut ProtoGenerateRequest,
     workers: &WorkerSelection,

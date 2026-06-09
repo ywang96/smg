@@ -525,10 +525,29 @@ impl ProtoGenerateRequest {
                 req.kv_transfer_params = Some(vllm::KvTransferParams {
                     remote_host,
                     remote_port,
+                    json_params: String::new(),
                 });
             }
             Self::Sglang(_) | Self::Trtllm(_) | Self::Mlx(_) | Self::TokenSpeed(_) => {
                 tracing::warn!("set_kv_transfer_params called on non-vLLM request, ignoring");
+            }
+        }
+    }
+
+    /// Set NIXL KV transfer parameters as an opaque JSON dict (vLLM only).
+    /// The prefill request carries `{"do_remote_decode": true}`; the decode
+    /// request carries the full params dict returned by the prefill worker.
+    pub fn set_kv_transfer_params_json(&mut self, json_params: String) {
+        match self {
+            Self::Vllm(req) => {
+                req.kv_transfer_params = Some(vllm::KvTransferParams {
+                    remote_host: String::new(),
+                    remote_port: 0,
+                    json_params,
+                });
+            }
+            Self::Sglang(_) | Self::Trtllm(_) | Self::Mlx(_) | Self::TokenSpeed(_) => {
+                tracing::warn!("set_kv_transfer_params_json called on non-vLLM request, ignoring");
             }
         }
     }
@@ -1048,6 +1067,20 @@ impl ProtoGenerateComplete {
                 .kv_transfer_params
                 .as_ref()
                 .map(|params| (params.remote_host.clone(), params.remote_port)),
+            Self::Sglang(_) | Self::Trtllm(_) | Self::Mlx(_) | Self::TokenSpeed(_) => None,
+        }
+    }
+
+    /// Get NIXL KV transfer parameters JSON from prefill response (vLLM only).
+    /// Returns the opaque params dict produced by NixlConnector, to be passed
+    /// verbatim into the decode request.
+    pub fn kv_transfer_params_json(&self) -> Option<String> {
+        match self {
+            Self::Vllm(c) => c
+                .kv_transfer_params
+                .as_ref()
+                .map(|params| params.json_params.clone())
+                .filter(|json| !json.is_empty()),
             Self::Sglang(_) | Self::Trtllm(_) | Self::Mlx(_) | Self::TokenSpeed(_) => None,
         }
     }
